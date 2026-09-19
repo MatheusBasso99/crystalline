@@ -3,6 +3,8 @@ require "./type_utils"
 
 module Crystalline::Lightweight
   class SummaryType
+    include JSON::Serializable
+
     getter name : String
     getter methods = [] of MethodInfo
     getter method_contracts = {} of String => Array(MethodContract)
@@ -14,8 +16,14 @@ module Crystalline::Lightweight
   end
 
   class Summary
+    include JSON::Serializable
+
     getter types = {} of String => SummaryType
+    @[JSON::Field(ignore: true)]
     @visited_types = Set(String).new
+
+    def initialize
+    end
 
     def self.from_result(result : Crystal::Compiler::Result) : self
       new.tap do |summary|

@@ -1,5 +1,32 @@
+require "json"
 require "compiler/crystal/syntax"
 require "./type_utils"
+
+# A location crosses the worker process boundary flattened to its expansion
+# site: a `VirtualFile` filename would otherwise drag the macro — and with
+# it the whole typed program — along.
+class Crystal::Location
+  def self.new(pull : JSON::PullParser)
+    pull.read_begin_array
+    filename = pull.read_string
+    line_number = pull.read_int.to_i32
+    column_number = pull.read_int.to_i32
+    pull.read_end_array
+    new(filename, line_number, column_number)
+  end
+
+  def to_json(json : JSON::Builder)
+    location = expanded_location
+    filename = location.try(&.filename.as?(String))
+    return json.null unless location && filename
+
+    json.array do
+      json.string(filename)
+      json.number(location.line_number)
+      json.number(location.column_number)
+    end
+  end
+end
 
 module Crystalline::Lightweight
   enum TypeKind
@@ -18,7 +45,9 @@ module Crystalline::Lightweight
     name : String,
     restriction : String?,
     # True for a splat argument (`*args`).
-    splat : Bool = false
+    splat : Bool = false do
+    include JSON::Serializable
+  end
 
   record MethodInfo,
     name : String,
@@ -35,9 +64,13 @@ module Crystalline::Lightweight
     block_restriction : String? = nil,
     # `**args` and `&block` arguments, which `Def#args` does not include.
     double_splat : ArgInfo? = nil,
-    block_arg : ArgInfo? = nil
+    block_arg : ArgInfo? = nil do
+    include JSON::Serializable
+  end
 
   class TypeInfo
+    include JSON::Serializable
+
     getter name : String
     getter kind : TypeKind
     getter doc : String?
@@ -60,11 +93,17 @@ module Crystalline::Lightweight
   end
 
   class Index
+    include JSON::Serializable
+
     getter types = {} of String => TypeInfo
     getter top_level_methods = [] of MethodInfo
     # Word-list constants (`COLORS = %w(...)`) that `{% for name in COLORS %}`
     # loops iterate: filled while walking this index's own source.
+    @[JSON::Field(ignore: true)]
     @constant_word_lists = {} of String => Array(String)
+
+    def initialize
+    end
 
     # Merges several indexes into one (e.g. the project's source files).
     # A type defined in several indexes (e.g. `Crystal::ASTNode` split
