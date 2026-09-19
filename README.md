@@ -342,6 +342,18 @@ crystalline:
 On Crystal 1.21+ the execution-contexts runtime is the default; `preview_mt`
 selects the legacy multithreaded runtime on older versions.
 
+### Memory
+
+The project is type-checked in a worker process (`crystalline --worker`), one
+per entry point. The worker of the last compile stays around to answer the
+hover, completion and go-to requests the lightweight analysis could not, and it
+exits when the project is compiled again or after 5 minutes without such a
+request — handing the memory of the typed program back to the operating system.
+
+Set `CRYSTALLINE_WORKER_IDLE_TIMEOUT` (in seconds) in the environment of the
+server to change that delay; `0` lets the worker go as soon as the compile
+ends, trading the compiler-backed fallback for the lowest memory usage.
+
 ## Features
 
 **Disclaimer: `Crystalline` is not as extensive in terms of features as other
@@ -404,8 +416,9 @@ closest-type-first. A background compile refines the results once it finishes.
 
 ## Limitations
 
-- Memory usage is high due to the boehm GC behaviour and the crystal compiler
-  itself. See: https://github.com/elbywan/crystalline/issues/23
+- Type-checking a large project takes gigabytes of memory, which is the
+  crystal compiler itself. It happens in a worker process, so that memory is
+  given back when the worker exits: see [Memory](#memory).
 
 - Due to Crystal having a wide type inference system (which is incredibly
   convenient and practical), compilation times can unfortunately be relatively
