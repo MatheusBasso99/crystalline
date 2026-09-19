@@ -8,6 +8,8 @@ require "./lightweight/completion"
 require "./lightweight/hover"
 require "./lightweight/definitions"
 require "./analysis/*"
+require "./semantic"
+require "./worker/*"
 
 class Crystalline::Workspace
   # The previous compilation results, indexed by compilation entry point.
@@ -15,7 +17,11 @@ class Crystalline::Workspace
   # Last successful semantic analysis results, used as a fast fallback for interactive features.
   # The cache survives document edits (only the compile-result dedup cache is invalidated);
   # semantic_cache_allowed? refuses to serve files that changed on disk after the compile.
-  @semantic_cache : Hash(String, Crystal::Compiler::Result) = {} of String => Crystal::Compiler::Result
+  # The typed programs themselves live in worker processes: an entry goes away
+  # when its entry point is compiled again, or once its worker has been idle for too long.
+  @semantic_cache : Hash(String, Semantic::Provider) = {} of String => Semantic::Provider
+  # The workers that are compiling right now, indexed by compilation entry point.
+  @compiling = {} of String => Worker::Client
   # On-disk modification time of every source file at the last successful compile.
   @compiled_source_mtimes : Hash(String, Time) = {} of String => Time
   # Lightweight queries per open document, keyed by (uri, version). Each one
@@ -123,24 +129,13 @@ class Crystalline::Workspace
     return unless (target = project.entry_point?)
 
     LSP::Log.info { "[compile] dependency recalculation: #{target.decoded_path}" }
-    lib_path = project.default_lib_path
-    Analysis.compile(server, target, lib_path: lib_path, ignore_diagnostics: true, wants_doc: true, top_level: true, compiler_flags: project.flags).try { |result|
-      project.dependencies = result.program.requires
-      # Build the summary and index off the event loop: they walk the whole
-      # typed program. The top-level pass gives the compiler-derived method
-      # restrictions and block contracts within seconds, before the full
-      # compile finishes.
-      summary, index = Analysis.run_dedicated do
-        {
-          Crystalline::Lightweight::Summary.from_result(result),
-          Crystalline::Lightweight::Index.from_program(result.program),
-        }
-      end
-      project.semantic_summary = summary
-      project.lightweight_index = index
-      @query_cache_lock.synchronize { @query_cache.clear }
-      warm_query_cache
-    }
+    # The top-level pass gives the compiler-derived method restrictions and
+    # block contracts within seconds, before the full compile finishes.
+    compile_in_worker(server, target, project, wants_doc: true, top_level: true, ignore_diagnostics: true) do |_worker, compiled, snapshot|
+      project.dependencies = compiled.requires.to_set
+      publish_snapshot(project, snapshot)
+      false
+    end
   rescue
     nil
   end
@@ -203,6 +198,13 @@ class Crystalline::Workspace
       return cached_result unless cached_result.nil? && discard_nil_cached_result
     end
 
+    # This request supersedes the compile in flight for the same target, if
+    # any: cancel it instead of waiting for an outdated result.
+    @compiling[target_string]?.try do |outdated|
+      LSP::Log.info { "[compile] superseded: cancelling the compile in flight for #{target.decoded_path}" }
+      outdated.close
+    end
+
     # Wait for pending compilations to finish…
     @@compilation_lock.synchronize do
       # Check again the cache in case some previous compilation that ran while waiting for the mutex to unlock is still valid.
@@ -214,52 +216,39 @@ class Crystalline::Workspace
 
       # Buffered: when the compilation outlives the timeout below, nobody is left
       # to receive the result and an unbuffered channel would block its fiber forever.
-      sync_channel = Channel(Crystal::Compiler::Result?).new(1)
+      sync_channel = Channel(Semantic::Provider?).new(1)
 
       progress.report(server) do
         # Store the start of the compilation.
         compilation_start = @result_cache.monotonic_now
+        result : Semantic::Provider? = nil
+        message = "Completed with errors."
 
-        lib_path = project.try(&.default_lib_path)
         LSP::Log.info { "[compile] analysis start: #{target.decoded_path}" }
-        result = Analysis.compile(server, target, lib_path: lib_path, ignore_diagnostics: ignore_diagnostics, wants_doc: wants_doc, top_level: top_level, compiler_flags: project.try(&.flags) || [] of String)
+        # One typed program per entry point at a time: the previous one is
+        # released before its replacement starts growing.
+        @semantic_cache.delete(target_string).try(&.close)
+        compile_in_worker(server, target, project, wants_doc: wants_doc, top_level: top_level, ignore_diagnostics: ignore_diagnostics) do |worker, compiled, snapshot|
+          message = "Completed successfully."
+          # Store the project dependencies.
+          project.try(&.dependencies = compiled.requires.to_set) if project.try(&.entry_point?)
+
+          # A client event may have invalidated the compile while it was
+          # running: the worker is only kept when still relevant.
+          next false if top_level || @result_cache.invalidated?(target_string, since: compilation_start)
+
+          result = @semantic_cache[target_string] = worker
+          stamp_compiled_sources(compiled.requires)
+          publish_snapshot(project, snapshot)
+          worker.close_when_idle
+          true
+        end
+        message = "Cancelled." if result.nil? && @result_cache.invalidated?(target_string, since: compilation_start)
         # Store the result in the cache, unless a client event invalided the previous cache.
         # For instance if a compilation is running, but the user saved the document in the meantime (before completion)
         # then we discard the result because it is already outdated.
         @result_cache.set(target_string, result, unless_invalidated_since: compilation_start)
-
-        if result && !top_level && !@result_cache.invalidated?(target_string)
-          # Build the summary and index off the event loop: they walk the
-          # whole typed program.
-          summary, index = Analysis.run_dedicated do
-            {
-              Crystalline::Lightweight::Summary.from_result(result),
-              Crystalline::Lightweight::Index.from_program(result.program),
-            }
-          end
-
-          # A client event may have invalidated the compile while the
-          # index/summary were being built: only publish when still relevant.
-          unless @result_cache.invalidated?(target_string)
-            @semantic_cache[target_string] = result
-            stamp_compiled_sources(result)
-            project.try &.semantic_summary = summary
-            project.try { |p| p.lightweight_index = index }
-            # The project index changed: cached lightweight queries are stale.
-            @query_cache_lock.synchronize { @query_cache.clear }
-            warm_query_cache
-          end
-        end
-
-        if result
-          if project.try(&.entry_point?)
-            # Store the project dependencies.
-            project.not_nil!.dependencies = result.program.requires
-          end
-          "Completed successfully."
-        else
-          "Completed with errors."
-        end
+        message
       ensure
         sync_channel.send(result)
       end
@@ -273,6 +262,46 @@ class Crystalline::Workspace
         nil
       end
     end
+  end
+
+  # Compiles *target* in a worker process and, on success, yields the worker
+  # along with what it reported and the lightweight snapshot it built. The
+  # worker outlives the call only when the block returns true.
+  private def compile_in_worker(server : LSP::Server, target : URI, project : Project?, *, wants_doc : Bool, top_level : Bool, ignore_diagnostics : Bool, & : Worker::Client, Worker::Compiled, Lightweight::Snapshot -> Bool) : Nil
+    job = Worker::Job.new(
+      entry: target.decoded_path,
+      snapshot_path: File.tempname("crystalline-snapshot", ".json"),
+      lib_path: project.try(&.default_lib_path),
+      flags: project.try(&.flags) || [] of String,
+      wants_doc: wants_doc,
+      top_level: top_level,
+    )
+    worker = Worker::Client.spawn
+    @compiling[target.to_s] = worker unless top_level
+    compiled = worker.compile(job) do |diagnostics|
+      Diagnostics.new(diagnostics).publish(server) unless ignore_diagnostics
+    end
+    # The snapshot is parsed off the event loop: it is large on a large project.
+    if compiled && compiled.success? && (snapshot = Analysis.run_dedicated { Worker::Client.take_snapshot(job) })
+      kept = yield worker, compiled, snapshot
+    end
+  ensure
+    if worker
+      @compiling.delete(target.to_s) if @compiling[target.to_s]?.same?(worker)
+      worker.close unless kept
+    end
+    File.delete?(job.snapshot_path) if job
+  end
+
+  # Swaps in the lightweight data of a finished compile.
+  private def publish_snapshot(project : Project?, snapshot : Lightweight::Snapshot) : Nil
+    return unless project
+
+    project.semantic_summary = snapshot.summary
+    project.lightweight_index = snapshot.index
+    # The project index changed: cached lightweight queries are stale.
+    @query_cache_lock.synchronize { @query_cache.clear }
+    warm_query_cache
   end
 
   private def project_for_file(file_uri : URI) : Project?
@@ -398,36 +427,15 @@ class Crystalline::Workspace
     false
   end
 
-  private def stamp_compiled_sources(result : Crystal::Compiler::Result)
+  private def stamp_compiled_sources(requires : Array(String))
     stamps = {} of String => Time
-    result.program.requires.each do |filename|
+    requires.each do |filename|
       begin
         stamps[filename] = File.info(filename).modification_time
       rescue File::NotFoundError
       end
     end
     @compiled_source_mtimes = stamps
-  end
-
-  private def append_markdown_doc(contents : Array(String), doc : String?)
-    if doc
-      contents << "----------"
-      contents << <<-MARKDOWN
-      #{doc}
-      MARKDOWN
-    end
-  end
-
-  private def code_markdown(str : String?, *, language = "") : String
-    if str
-      <<-MARKDOWN
-      ```#{language}
-      #{str}
-      ```
-      MARKDOWN
-    else
-      ""
-    end
   end
 
   def hover(server : LSP::Server, file_uri : URI, position : LSP::Position)
@@ -458,72 +466,7 @@ class Crystalline::Workspace
     end
 
     LSP::Log.info { "[hover] semantic cache hit: #{file_uri.decoded_path}:#{position.line}:#{position.character}" }
-    location = Crystal::Location.new(
-      file_uri.decoded_path,
-      line_number: position.line + 1,
-      column_number: position.character + 1
-    )
-    result.try { |r|
-      Analysis.nodes_at_cursor(r, location)
-    }.try do |nodes, _context|
-      n = nodes.last?
-      contents = [] of String
-
-      # LSP::Log.info { "Node at cursor: #{n}" }
-      # LSP::Log.info { "Node class: #{n.class}" }
-      # LSP::Log.info { "Node expansion: #{n.expanded if n.responds_to? :expanded}" }
-      # LSP::Log.info { "Node type: #{n.try &.type?}" }
-      # LSP::Log.info { "Node type class: #{n.try &.type?.try &.class}" }
-      # LSP::Log.info { "Nodes classes: #{nodes.map &.class}" }
-      # LSP::Log.info { "Context: #{_context}" }
-
-      if n.is_a? Crystal::Def || n.is_a? Crystal::Macro
-        contents << code_markdown(Utils.format_def(n), language: "crystal")
-        append_markdown_doc contents, n.doc
-      elsif (n.is_a? Crystal::MacroExpression || n.is_a? Crystal::MacroIf) && n.expanded
-        contents << code_markdown(n.expanded.to_s, language: "crystal")
-      elsif n.responds_to? :resolved_type
-        str = ""
-        if n.responds_to? :name
-          str += "#{n.name}: #{n.resolved_type}"
-        else
-          str += n.resolved_type.to_s
-          str = n.to_s if str.empty?
-        end
-        contents << code_markdown(str, language: "crystal")
-        append_markdown_doc contents, n.resolved_type.doc
-      elsif n.is_a? Crystal::Call
-        if (definition = n.target_defs.try &.first?)
-          contents << code_markdown(Utils.format_def(definition), language: "crystal")
-        elsif n.expanded && n.expanded_macro
-          contents << code_markdown(n.expanded.to_s, language: "crystal")
-        end
-        append_markdown_doc contents, (definition || n.expanded_macro).try &.doc
-      elsif n.is_a? Crystal::Path
-        node_type = n.type? || Utils.resolve_path(n, nodes)
-        if node_type
-          contents << code_markdown(node_type.to_s, language: "crystal")
-          append_markdown_doc contents, node_type.doc
-        end
-      elsif n
-        str = ""
-        if n.responds_to? :name
-          str += "#{n.name}: #{n.type? || "?"}"
-        else
-          str += n.type?.to_s
-          str = n.to_s if str.empty?
-        end
-        contents << code_markdown(str, language: "crystal")
-        append_markdown_doc contents, n.doc
-      end
-
-      LSP::Hover.new(
-        contents: LSP::MarkupContent.new(
-          kind: LSP::MarkupKind::MarkDown,
-          value: contents.join "\n",
-        ),
-      )
-    end
+    result.hover(file_uri, position)
   rescue
     nil
   end
@@ -553,52 +496,7 @@ class Crystalline::Workspace
     end
 
     LSP::Log.info { "[definitions] semantic cache hit: #{file_uri.decoded_path}:#{position.line}:#{position.character}" }
-
-    location = Crystal::Location.new(
-      file_uri.decoded_path,
-      line_number: position.line + 1,
-      column_number: position.character + 1
-    )
-    result.try { |r|
-      Analysis.definitions_at_cursor(r, location)
-    }.try do |definitions|
-      node = definitions.node
-      definitions.locations.try &.map { |start_loc, end_loc|
-        if node.is_a? Crystal::Path || node.is_a? Crystal::Require
-          target_uri = "file://#{start_loc.original_filename}"
-          origin_location = node.location.not_nil!
-          origin_end_location = definitions.node.end_location || Crystal::Location.new(
-            file_uri.decoded_path,
-            line_number: origin_location.line_number + 1,
-            column_number: 0
-          )
-
-          origin_selection_range = LSP::Range.new(
-            start: LSP::Position.new(line: origin_location.line_number - 1, character: origin_location.column_number - 1),
-            end: LSP::Position.new(line: origin_end_location.line_number - 1, character: origin_end_location.column_number),
-          )
-          target_range = LSP::Range.new(
-            start: LSP::Position.new(line: start_loc.line_number - 1, character: start_loc.column_number - 1),
-            end: LSP::Position.new(line: end_loc.line_number - 1, character: end_loc.column_number),
-          )
-
-          LSP::LocationLink.new(
-            target_uri: target_uri,
-            origin_selection_range: origin_selection_range,
-            target_range: target_range,
-            target_selection_range: target_range,
-          )
-        else
-          LSP::Location.new(
-            uri: "file://#{start_loc.original_filename}",
-            range: LSP::Range.new(
-              start: LSP::Position.new(line: start_loc.line_number - 1, character: start_loc.column_number - 1),
-              end: LSP::Position.new(line: end_loc.line_number - 1, character: end_loc.column_number),
-            ),
-          )
-        end
-      }
-    end
+    result.definitions(file_uri, position)
   rescue
     nil
   end
@@ -610,8 +508,6 @@ class Crystalline::Workspace
     document_lines = fix_source(text_document.contents).lines(chomp: false)
     completion_context = CompletionContext.detect(document_lines[position.line], position.character, trigger_character)
     return unless completion_context
-
-    trigger_character = completion_context.trigger_character
 
     if query = lightweight_query_for(text_document)
       completion_items, reason = Crystalline::Lightweight::Completion.complete_and_reason(document_lines.join, position.line, completion_context, query)
@@ -628,12 +524,6 @@ class Crystalline::Workspace
       LSP::Log.info { "[completion] lightweight miss: #{file_uri.decoded_path}:#{position.line}:#{position.character} reason=no lightweight query" }
     end
 
-    location = Crystal::Location.new(
-      file_uri.decoded_path,
-      line_number: position.line + 1,
-      column_number: completion_context.analysis_column,
-    )
-
     unless semantic_cache_allowed?(file_uri)
       LSP::Log.info { "[completion] bail on dirty buffer: #{file_uri.decoded_path}:#{position.line}:#{position.character}" }
       return
@@ -646,138 +536,7 @@ class Crystalline::Workspace
     end
 
     LSP::Log.info { "[completion] semantic cache hit: #{file_uri.decoded_path}:#{position.line}:#{position.character}" }
-
-    nodes, _ = Analysis.nodes_at_cursor(result, location)
-    nodes.last?.try do |n|
-      completion_items = [] of LSP::CompletionItem
-
-      # LSP::Log.info { "Node at cursor: #{n}" }
-      # LSP::Log.info { "Node class: #{n.class}" }
-      # LSP::Log.info { "Node type: #{n.type?}" }
-      # LSP::Log.info { "Node type class: #{n.type?.try &.class}" }
-      # LSP::Log.info { "Node type defs: #{n.type?.try &.defs}" }
-
-      range = completion_context.completion_range(position.line)
-
-      case trigger_character
-      when "."
-        node_type = n.type?
-        node_type = node_type.base_type if node_type.responds_to? :base_type
-
-        # We are looking for methods…
-        if node_type.responds_to? :defs
-          Analysis.all_defs(node_type.not_nil!).each { |def_name, definition, owner_type, nesting|
-            owner_prefix = "*Inherited from: #{owner_type.name}*\n\n" if owner_type.responds_to? :name && owner_type != n.type
-            owner_prefix ||= ""
-            documentation = (owner_prefix + (definition.doc || ""))
-
-            text_edit = LSP::TextEdit.new(
-              range: range,
-              new_text: def_name,
-            )
-
-            completion_items << LSP::CompletionItem.new(
-              label: Utils.format_def(definition, short: true),
-              insert_text: def_name,
-              kind: LSP::CompletionItemKind::Function,
-              filter_text: def_name,
-              detail: Utils.format_def(definition),
-              text_edit: text_edit,
-              sort_text: (nesting + 1).chr.to_s + def_name,
-              documentation: documentation.try { |doc|
-                LSP::MarkupContent.new(
-                  kind: LSP::MarkupKind::MarkDown,
-                  value: doc,
-                )
-              },
-            )
-          }
-
-          Analysis.all_macros(n.type).each { |macro_name, macro_def, owner_type, nesting|
-            owner_prefix = "*Inherited from: #{owner_type.name}*\n\n" if owner_type.responds_to? :name && owner_type != n.type
-            owner_prefix ||= ""
-            documentation = (owner_prefix + (macro_def.doc || ""))
-
-            text_edit = LSP::TextEdit.new(
-              range: range,
-              new_text: macro_name,
-            )
-
-            completion_items << LSP::CompletionItem.new(
-              label: Utils.format_def(macro_def, short: true),
-              insert_text: macro_name,
-              kind: LSP::CompletionItemKind::Method,
-              filter_text: macro_name,
-              detail: Utils.format_def(macro_def),
-              text_edit: text_edit,
-              sort_text: (nesting + 1).chr.to_s + macro_name,
-              documentation: documentation.try { |doc|
-                LSP::MarkupContent.new(
-                  kind: LSP::MarkupKind::MarkDown,
-                  value: doc,
-                )
-              },
-            )
-          }
-        end
-      when ":"
-        # We are looking for module types…
-        node_type = n.type?
-
-        if n.is_a? Crystal::Path
-          node_type ||= Utils.resolve_path(n, nodes)
-        end
-
-        if node_type.is_a? Crystal::MetaclassType
-          node_type = node_type.instance_type
-
-          Analysis.all_submodules(result, node_type).uniq(&.to_s).each { |type|
-            type_string = type.to_s
-
-            text_edit = LSP::TextEdit.new(
-              range: range,
-              new_text: type_string.lchop(node_type.to_s).lchop(trigger_character || ':'),
-            )
-
-            completion_items << LSP::CompletionItem.new(
-              label: type_string,
-              text_edit: text_edit,
-              kind: Crystalline::Utils.map_completion_kind(type, default: LSP::CompletionItemKind::Module),
-              documentation: type.doc.try { |doc|
-                LSP::MarkupContent.new(
-                  kind: LSP::MarkupKind::MarkDown,
-                  value: doc,
-                )
-              },
-            )
-          }
-        end
-      else
-        # Context autocompletion.
-        context = Analysis.context_at(result, location)
-        if trigger_character == "@"
-          context.try &.select!(&.starts_with?("@"))
-        end
-        context.try &.each { |name, type|
-          label = "#{name} : #{type}"
-          text_edit = LSP::TextEdit.new(
-            range: range,
-            new_text: name.lchop(trigger_character || ""),
-          )
-          completion_items << LSP::CompletionItem.new(
-            label: label,
-            text_edit: text_edit,
-            kind: LSP::CompletionItemKind::Variable,
-            documentation: type.doc.try { |doc|
-              LSP::MarkupContent.new(
-                kind: LSP::MarkupKind::MarkDown,
-                value: doc,
-              )
-            },
-          )
-        }
-      end
-
+    result.completion(file_uri, position, document_lines[position.line], trigger_character).try do |completion_items|
       build_completion_list(completion_items)
     end
   rescue

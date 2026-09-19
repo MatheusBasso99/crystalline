@@ -31,7 +31,9 @@ module Crystalline::Lightweight
     types : Array(String) = [] of String,
     block_args : Array(Array(String)) = [] of Array(String),
     result_shape : MethodContractResultShape? = nil,
-    class_method : Bool = false
+    class_method : Bool = false do
+    include JSON::Serializable
+  end
 
   module Contracts
     extend self

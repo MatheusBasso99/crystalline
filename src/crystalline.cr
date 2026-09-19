@@ -6,4 +6,9 @@ if ARGV.includes?("--version")
   exit
 end
 
+if ARGV.includes?("--worker")
+  Crystalline::Worker.start
+  exit
+end
+
 Crystalline.init

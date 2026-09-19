@@ -50,17 +50,25 @@ module Crystalline::Analysis
   # Compile a target *file_uri*.
   def self.compile(server : LSP::Server, file_uri : URI, *, lib_path : String? = nil, file_overrides : Hash(String, String)? = nil, ignore_diagnostics = false, wants_doc = false, fail_fast = false, top_level = false, compiler_flags : Array(String) = [] of String) : Crystal::Compiler::Result?
     if file_uri.scheme == "file"
-      file = File.new file_uri.decoded_path
-      sources = [
-        Crystal::Compiler::Source.new(file_uri.decoded_path, file.gets_to_end),
-      ]
-      file.close
-      self.compile(server, sources, lib_path: lib_path, file_overrides: file_overrides, ignore_diagnostics: ignore_diagnostics, wants_doc: wants_doc, fail_fast: fail_fast, top_level: top_level, compiler_flags: compiler_flags)
+      self.compile(server, sources_for(file_uri.decoded_path), lib_path: lib_path, file_overrides: file_overrides, ignore_diagnostics: ignore_diagnostics, wants_doc: wants_doc, fail_fast: fail_fast, top_level: top_level, compiler_flags: compiler_flags)
     end
   end
 
-  # Compile an array of *sources*.
+  # Compile an array of *sources* and publish the diagnostics to the client.
   def self.compile(server : LSP::Server, sources : Array(Crystal::Compiler::Source), *, lib_path : String? = nil, file_overrides : Hash(String, String)? = nil, ignore_diagnostics = false, wants_doc = false, fail_fast = false, top_level = false, compiler_flags : Array(String) = [] of String)
+    result, diagnostics = compile_with_diagnostics(sources, lib_path: lib_path, file_overrides: file_overrides, wants_doc: wants_doc, fail_fast: fail_fast, top_level: top_level, compiler_flags: compiler_flags)
+    diagnostics.publish(server) unless ignore_diagnostics
+    result
+  end
+
+  # The sources of a compilation whose entry point is the file at *path*.
+  def self.sources_for(path : String) : Array(Crystal::Compiler::Source)
+    [Crystal::Compiler::Source.new(path, File.read(path))]
+  end
+
+  # Compile an array of *sources*. The diagnostics are returned instead of
+  # being published: the worker process has no client to publish them to.
+  def self.compile_with_diagnostics(sources : Array(Crystal::Compiler::Source), *, lib_path : String? = nil, file_overrides : Hash(String, String)? = nil, wants_doc = false, fail_fast = false, top_level = false, compiler_flags : Array(String) = [] of String) : {Crystal::Compiler::Result?, Diagnostics}
     diagnostics = Diagnostics.new
     reply_channel = Channel(Crystal::Compiler::Result | Exception).new
 
@@ -109,34 +117,29 @@ module Crystalline::Analysis
 
     raise result if result.is_a? Exception
 
-    unless ignore_diagnostics
-      result.program.requires.each do |path|
-        diagnostics.init_value("file://#{path}")
-      end
-
-      result.program.error_stack.try &.each do |e|
-        next unless e.is_a?(Crystal::TypeException) || e.is_a?(Crystal::SyntaxException)
-        # The error-tolerant semantic can emit bogus errors inside the stdlib's
-        # llvm wrapper (e.g. Bool-to-Int32 conversions that a regular compile
-        # never reports, see di_builder.cr). Real user-facing errors surface at
-        # the user's call site instead, so these are safe to skip.
-        next if stdlib_llvm_error?(e)
-        diagnostics.append_from_exception(e)
-      end
+    result.program.requires.each do |path|
+      diagnostics.init_value("file://#{path}")
     end
 
-    result
+    result.program.error_stack.try &.each do |e|
+      next unless e.is_a?(Crystal::TypeException) || e.is_a?(Crystal::SyntaxException)
+      # The error-tolerant semantic can emit bogus errors inside the stdlib's
+      # llvm wrapper (e.g. Bool-to-Int32 conversions that a regular compile
+      # never reports, see di_builder.cr). Real user-facing errors surface at
+      # the user's call site instead, so these are safe to skip.
+      next if stdlib_llvm_error?(e)
+      diagnostics.append_from_exception(e)
+    end
+
+    {result, diagnostics}
   rescue e : Exception
     if e.is_a?(Crystal::TypeException) || e.is_a?(Crystal::SyntaxException)
       LSP::Log.debug(exception: e) { "#{e}" }
-      diagnostics.try &.append_from_exception(e) unless ignore_diagnostics
+      diagnostics.try &.append_from_exception(e)
     else
       LSP::Log.debug(exception: e) { "#{e.message}\n#{e.backtrace?}" }
     end
-    nil
-  ensure
-    # Propagate diagnostics to the client.
-    diagnostics.try &.publish(server) unless ignore_diagnostics
+    {nil, diagnostics || Diagnostics.new}
   end
 
   # True when the error is located inside the stdlib's llvm wrapper, where the

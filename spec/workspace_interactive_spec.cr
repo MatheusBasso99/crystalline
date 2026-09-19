@@ -3,6 +3,9 @@ require "file_utils"
 require "../src/crystalline/requires"
 require "../src/crystalline/main"
 
+# The spec executable cannot be started as a compile worker.
+Crystalline::Worker::Client.isolated = false
+
 private def with_workspace_document(source : String, &)
   root = File.join(Dir.tempdir, "crystalline-workspace-interactive-#{Random::Secure.hex(8)}")
   Dir.mkdir_p(root)
@@ -38,7 +41,7 @@ class Crystalline::Workspace
   end
 
   def seed_semantic_result(key : String, result : Crystal::Compiler::Result)
-    @semantic_cache[key] = result
+    @semantic_cache[key] = Crystalline::Semantic::Local.new(result)
   end
 
   def seed_compiled_source_mtime(path : String, time : Time)
@@ -46,7 +49,7 @@ class Crystalline::Workspace
   end
 
   def seed_result_cache(key : String, result : Crystal::Compiler::Result?)
-    @result_cache.set(key, result)
+    @result_cache.set(key, result.try { |r| Crystalline::Semantic::Local.new(r) })
   end
 
   def result_cache_invalidated?(key : String) : Bool

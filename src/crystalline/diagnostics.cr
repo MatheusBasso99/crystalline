@@ -3,8 +3,11 @@ require "lsp/base/diagnostic"
 class Crystalline::Diagnostics
   alias DiagnosticsHash = Hash(String, Array(LSP::Diagnostic))
 
-  @diagnostics : DiagnosticsHash = {} of String => Array(LSP::Diagnostic)
+  @diagnostics : DiagnosticsHash
   forward_missing_to(@diagnostics)
+
+  def initialize(@diagnostics = DiagnosticsHash.new)
+  end
 
   def append(diagnostic : LSP::Diagnostic)
     key = "file://#{diagnostic.source}"
