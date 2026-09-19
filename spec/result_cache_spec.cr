@@ -3,7 +3,7 @@ require "../src/crystalline/requires"
 require "../src/crystalline/result_cache"
 
 private def compiled_result
-  Crystal::Compiler::Result.new(Crystal::Program.new, Crystal::Nop.new)
+  Crystalline::Semantic::Local.new(Crystal::Compiler::Result.new(Crystal::Program.new, Crystal::Nop.new))
 end
 
 describe Crystalline::ResultCache do

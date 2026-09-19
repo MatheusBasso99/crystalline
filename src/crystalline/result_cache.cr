@@ -1,6 +1,9 @@
+require "./semantic"
+
 class Crystalline::ResultCache
-  # A cache of compiler results with invalidation time, indexed by file name.
-  @cache : Hash(String, {Crystal::Compiler::Result?, Time::Instant?}) = Hash(String, {Crystal::Compiler::Result?, Time::Instant?}).new
+  # A cache of compilation results with invalidation time, indexed by file name.
+  # A result is the semantic provider of the compilation, nil when it failed.
+  @cache : Hash(String, {Semantic::Provider?, Time::Instant?}) = Hash(String, {Semantic::Provider?, Time::Instant?}).new
 
   # Remove the result, store the timestamp.
   def invalidate(entry : String)
@@ -32,7 +35,7 @@ class Crystalline::ResultCache
   #
   # If *unless_invalidated_since* is provided, is will not store the result if the previous result has been
   # invalidated since the privided timestamp.
-  def set(entry : String, result : Crystal::Compiler::Result?, *, unless_invalidated_since : Time::Instant? = nil)
+  def set(entry : String, result : Semantic::Provider?, *, unless_invalidated_since : Time::Instant? = nil)
     invalidated = unless_invalidated_since && invalidated?(entry, since: unless_invalidated_since)
     @cache[entry] = {result, nil} unless invalidated
   end

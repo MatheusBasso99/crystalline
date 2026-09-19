@@ -18,7 +18,7 @@ SITES = [
   {"src/crystalline/lightweight/completion.cr", "text_edit: LSP::TextEdit.new(", 2, "nested TextEdit cut 2"},
   {"src/crystalline/completion_context.cr", "spans << TokenSpan.new(", 1, "TokenSpan cut"},
   {"src/crystalline/completion_context.cr", "tokens.each do |token|", 1, "do-block header cut"},
-  {"src/crystalline/workspace.cr", "start: LSP::Position.new(line: start_loc.line_number - 1, character: start_loc.column_number - 1),", 1, "three-level call cut"},
+  {"src/crystalline/semantic.cr", "start: LSP::Position.new(line: start_loc.line_number - 1, character: start_loc.column_number - 1),", 1, "three-level call cut"},
   {"src/crystalline/controller.cr", "range: message.params.range,", 1, "array-in-blocks cut"},
   {"src/crystalline/lightweight/index.cr", "record_info.methods << MethodInfo.new(", 1, "MethodInfo cut"},
 ]
