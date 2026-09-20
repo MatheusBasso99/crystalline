@@ -349,6 +349,8 @@ per entry point. The worker of the last compile stays around to answer the
 hover, completion and go-to requests the lightweight analysis could not, and it
 exits when the project is compiled again or after 5 minutes without such a
 request — handing the memory of the typed program back to the operating system.
+It also exits as soon as the system reports that it is running short of memory
+(the memory pressure level on macOS, the pressure stall information on Linux).
 
 Set `CRYSTALLINE_WORKER_IDLE_TIMEOUT` (in seconds) in the environment of the
 server to change that delay; `0` lets the worker go as soon as the compile

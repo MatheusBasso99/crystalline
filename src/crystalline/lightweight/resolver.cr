@@ -8,9 +8,9 @@ module Crystalline::Lightweight
     extend self
 
     SAFE_TRY_SEGMENT = "__lightweight_try__"
-    INDEX_SEGMENT = "__lightweight_index__"
-    RANGE_SEGMENT = "__lightweight_range__"
-    CAST_SEGMENT = "__lightweight_cast__"
+    INDEX_SEGMENT    = "__lightweight_index__"
+    RANGE_SEGMENT    = "__lightweight_range__"
+    CAST_SEGMENT     = "__lightweight_cast__"
 
     def receiver_types(source : String, line_number : Int32, analysis_column : Int32, receiver : String, query : Query) : {Array(String), Bool}
       # A quoted-string root (`"= #{a.b}".colorize`) contains dots inside
@@ -327,10 +327,10 @@ module Crystalline::Lightweight
                 (group_start + 1...index - 1).each { |i| io << chars[i] }
               end
               str << if inner.gsub(/"[^"]*"|'[^']*'/, "").includes?("..")
-                       ".#{RANGE_SEGMENT}"
-                     else
-                       ".#{INDEX_SEGMENT}"
-                     end
+                ".#{RANGE_SEGMENT}"
+              else
+                ".#{INDEX_SEGMENT}"
+              end
               # `[] of String` — an array literal's of-clause: consume it
               # so the walk-back lands on the index segment (the receiver
               # root resolves it to `Array(T)`), not on the element type.

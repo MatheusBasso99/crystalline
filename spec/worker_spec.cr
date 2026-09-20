@@ -5,6 +5,8 @@ require "../src/crystalline/main"
 
 # The spec executable cannot be started as a compile worker.
 Crystalline::Worker::Client.isolated = false
+# Whatever the machine running the specs is going through.
+Crystalline::Worker::Client.memory_pressure = -> { false }
 
 private def with_worker_project(source : String, &)
   root = File.join(Dir.tempdir, "crystalline-worker-#{Random::Secure.hex(8)}")
@@ -156,6 +158,33 @@ describe Crystalline::Worker do
   ensure
     Crystalline::Worker::Client.idle_timeout = previous if previous
   end
+
+  it "lets go of an idle worker when the system runs short of memory" do
+    Crystalline::Worker::Client.memory_pressure = -> { true }
+    worker = Crystalline::Worker::Client.new(IO::Memory.new, IO::Memory.new)
+    worker.close_when_idle
+
+    worker.closed?.should be_false
+    sleep 50.milliseconds
+    worker.closed?.should be_true
+  ensure
+    Crystalline::Worker::Client.memory_pressure = -> { false }
+  end
+end
+
+describe Crystalline::MemoryPressure do
+  it "reads the pressure stall information of Linux" do
+    calm = "some avg10=0.31 avg60=0.12 avg300=0.02 total=1234\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+    short = "some avg10=23.40 avg60=9.12 avg300=2.02 total=99999\nfull avg10=11.00 avg60=3.00 avg300=1.00 total=555\n"
+
+    Crystalline::MemoryPressure.stalled?(calm).should be_false
+    Crystalline::MemoryPressure.stalled?(short).should be_true
+    Crystalline::MemoryPressure.stalled?("").should be_false
+  end
+
+  it "tells, or says false where it cannot" do
+    Crystalline::MemoryPressure.high?.should be_a(Bool)
+  end
 end
 
 class Crystalline::Workspace
@@ -200,6 +229,47 @@ describe Crystalline::Workspace do
 end
 
 describe Crystalline::Lightweight::Snapshot do
+  it "writes the snapshot it would build" do
+    with_worker_project(SOURCE) do |_root, path|
+      result = Crystalline::Analysis.compile(LSP::Server.new(IO::Memory.new, IO::Memory.new), URI.parse("file://#{path}"), ignore_diagnostics: true, wants_doc: true).not_nil!
+      built = JSON.parse(Crystalline::Lightweight::Snapshot.from_result(result).to_json)
+      written = JSON.parse(String.build { |io| Crystalline::Lightweight::Snapshot.write(result, io) })
+
+      written.should eq(built)
+      written["summary"]["types"].as_h.has_key?("Greeter").should be_true
+    end
+  end
+
+  it "reads equal strings as one object" do
+    source = <<-CRYSTAL
+      class Greeter
+        def shout(text : String) : String
+          text.upcase
+        end
+
+        def whisper(text : String) : String
+          text.downcase
+        end
+      end
+
+      Greeter.new.shout(Greeter.new.whisper("hi"))
+      CRYSTAL
+
+    with_worker_project(source) do |_root, path|
+      result = Crystalline::Analysis.compile(LSP::Server.new(IO::Memory.new, IO::Memory.new), URI.parse("file://#{path}"), ignore_diagnostics: true, wants_doc: true).not_nil!
+      json = String.build { |io| Crystalline::Lightweight::Snapshot.write(result, io) }
+      snapshot = Crystalline::Lightweight::Snapshot.read(IO::Memory.new(json))
+
+      snapshot.to_json.should eq(Crystalline::Lightweight::Snapshot.from_json(json).to_json)
+      methods = snapshot.index.types["Greeter"].methods
+      methods.size.should be > 1
+      filenames = methods.compact_map(&.location.try(&.filename.as?(String)))
+      filenames.size.should be > 1
+      filenames.each(&.should(be(filenames.first)))
+      methods.each(&.owner.should(be(methods.first.owner)))
+    end
+  end
+
   it "flattens macro-generated locations to their expansion site" do
     source = <<-CRYSTAL
       macro define_greet

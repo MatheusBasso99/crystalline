@@ -66,6 +66,12 @@ module Crystalline::Lightweight
     double_splat : ArgInfo? = nil,
     block_arg : ArgInfo? = nil do
     include JSON::Serializable
+
+    # True when both methods restrict their arguments the same way. It does
+    # not allocate: it runs for every pair of overloads of a type.
+    def same_restrictions?(other : MethodInfo) : Bool
+      args.equals?(other.args) { |arg, other_arg| arg.restriction == other_arg.restriction }
+    end
   end
 
   class TypeInfo
@@ -169,7 +175,7 @@ module Crystalline::Lightweight
         left.owner == right.owner &&
         left.class_method == right.class_method &&
         left.macro == right.macro &&
-        left.args.map(&.restriction) == right.args.map(&.restriction)
+        left.same_restrictions?(right)
     end
 
     def self.from_program(program : Crystal::Program) : self

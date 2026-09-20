@@ -301,7 +301,13 @@ class Crystalline::Workspace
     project.lightweight_index = snapshot.index
     # The project index changed: cached lightweight queries are stale.
     @query_cache_lock.synchronize { @query_cache.clear }
-    warm_query_cache
+    spawn do
+      warm_query_cache
+      # The previous snapshot, and what reading the new one left behind, are
+      # garbage by now. The server allocates too little between two compiles
+      # for the collector to ever give their room back on its own.
+      GC.collect_and_unmap
+    end
   end
 
   private def project_for_file(file_uri : URI) : Project?
@@ -368,16 +374,14 @@ class Crystalline::Workspace
     query
   end
 
-  # Rebuild the cached lightweight query of every opened document in the
-  # background, so the first interactive request after a compile does not pay
-  # the project-index merge. Runs on the compile context: snapshot the open
+  # Rebuild the cached lightweight query of every opened document, so the
+  # first interactive request after a compile does not pay the project-index
+  # merge. Runs in the background, on the compile context: snapshot the open
   # documents under a lock before touching them.
   private def warm_query_cache
-    spawn do
-      documents = @documents_mutex.synchronize { @opened_documents.values.dup }
-      documents.each do |document|
-        lightweight_query_for(document)
-      end
+    documents = @documents_mutex.synchronize { @opened_documents.values.dup }
+    documents.each do |document|
+      lightweight_query_for(document)
     end
   end
 
