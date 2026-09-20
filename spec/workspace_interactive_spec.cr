@@ -5,6 +5,7 @@ require "../src/crystalline/main"
 
 # The spec executable cannot be started as a compile worker.
 Crystalline::Worker::Client.isolated = false
+Crystalline::Worker::Client.memory_pressure = -> { false }
 
 private def with_workspace_document(source : String, &)
   root = File.join(Dir.tempdir, "crystalline-workspace-interactive-#{Random::Secure.hex(8)}")

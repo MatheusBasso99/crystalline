@@ -1,6 +1,7 @@
 require "./protocol"
 require "./runner"
 require "../semantic"
+require "../memory_pressure"
 require "../lightweight/snapshot"
 
 # The server side of a compile worker: spawns the process, runs one job on it
@@ -11,7 +12,12 @@ class Crystalline::Worker::Client < Crystalline::Semantic::Provider
   # worker go as soon as its compile ends.
   class_property idle_timeout : Time::Span = (ENV["CRYSTALLINE_WORKER_IDLE_TIMEOUT"]?.try(&.to_i?) || 300).seconds
 
-  QUERY_TIMEOUT = 15.seconds
+  # An idle worker is a convenience worth gigabytes: it goes as soon as the
+  # system runs short of memory, whatever is left of its idle timeout.
+  class_property memory_pressure : -> Bool = -> { MemoryPressure.high? }
+
+  QUERY_TIMEOUT           = 15.seconds
+  PRESSURE_CHECK_INTERVAL = 5.seconds
 
   # The GC never hands memory back on its defaults, and grows the heap
   # eagerly: on a large project that is a gigabyte of difference at the peak.
@@ -84,11 +90,14 @@ class Crystalline::Worker::Client < Crystalline::Semantic::Provider
     ::spawn do
       until closed?
         remaining = self.class.idle_timeout - (Time.instant - @last_used)
-        if remaining > Time::Span.zero
-          sleep remaining
-        else
+        if remaining <= Time::Span.zero
           LSP::Log.info { "[worker] idle for #{self.class.idle_timeout.total_seconds.to_i}s: releasing the typed program" }
           close
+        elsif self.class.memory_pressure.call
+          LSP::Log.info { "[worker] the system is short of memory: releasing the typed program" }
+          close
+        else
+          sleep Math.min(remaining, PRESSURE_CHECK_INTERVAL)
         end
       end
     end
