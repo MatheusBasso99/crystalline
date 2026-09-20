@@ -69,7 +69,7 @@ class Crystalline::Worker::Client < Crystalline::Semantic::Provider
 
   # The snapshot of a successful *job*. The file it travelled in is removed.
   def self.take_snapshot(job : Job) : Lightweight::Snapshot?
-    File.open(job.snapshot_path) { |file| Lightweight::Snapshot.from_json(file) }
+    File.open(job.snapshot_path) { |file| Lightweight::Snapshot.read(file) }
   rescue ex : File::Error | JSON::ParseException
     LSP::Log.warn(exception: ex) { "[worker] unreadable snapshot: #{ex.message}" }
     nil

@@ -200,6 +200,47 @@ describe Crystalline::Workspace do
 end
 
 describe Crystalline::Lightweight::Snapshot do
+  it "writes the snapshot it would build" do
+    with_worker_project(SOURCE) do |_root, path|
+      result = Crystalline::Analysis.compile(LSP::Server.new(IO::Memory.new, IO::Memory.new), URI.parse("file://#{path}"), ignore_diagnostics: true, wants_doc: true).not_nil!
+      built = JSON.parse(Crystalline::Lightweight::Snapshot.from_result(result).to_json)
+      written = JSON.parse(String.build { |io| Crystalline::Lightweight::Snapshot.write(result, io) })
+
+      written.should eq(built)
+      written["summary"]["types"].as_h.has_key?("Greeter").should be_true
+    end
+  end
+
+  it "reads equal strings as one object" do
+    source = <<-CRYSTAL
+      class Greeter
+        def shout(text : String) : String
+          text.upcase
+        end
+
+        def whisper(text : String) : String
+          text.downcase
+        end
+      end
+
+      Greeter.new.shout(Greeter.new.whisper("hi"))
+      CRYSTAL
+
+    with_worker_project(source) do |_root, path|
+      result = Crystalline::Analysis.compile(LSP::Server.new(IO::Memory.new, IO::Memory.new), URI.parse("file://#{path}"), ignore_diagnostics: true, wants_doc: true).not_nil!
+      json = String.build { |io| Crystalline::Lightweight::Snapshot.write(result, io) }
+      snapshot = Crystalline::Lightweight::Snapshot.read(IO::Memory.new(json))
+
+      snapshot.to_json.should eq(Crystalline::Lightweight::Snapshot.from_json(json).to_json)
+      methods = snapshot.index.types["Greeter"].methods
+      methods.size.should be > 1
+      filenames = methods.compact_map(&.location.try(&.filename.as?(String)))
+      filenames.size.should be > 1
+      filenames.each(&.should(be(filenames.first)))
+      methods.each(&.owner.should(be(methods.first.owner)))
+    end
+  end
+
   it "flattens macro-generated locations to their expansion site" do
     source = <<-CRYSTAL
       macro define_greet
