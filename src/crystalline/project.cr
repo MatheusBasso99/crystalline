@@ -13,6 +13,10 @@ class Crystalline::Project
   property semantic_summary : Crystalline::Lightweight::Summary?
   # The dependencies of the project, meaning the list of files required by the compilation target (entry point).
   property dependencies : Set(String) = Set(String).new
+  # Files under the root that a dependency calculation looked for and did not
+  # reach: each compiles as its own entry point until a compile of the
+  # project's entry point reaches it.
+  getter outsiders = Set(String).new
   # Parse-only index of the project's own source files (src/ + lib/), built
   # lazily before the first compile so receivers of project types resolve
   # during the cold-start window. Invalidated when a project file is saved
@@ -43,6 +47,16 @@ class Crystalline::Project
   rescue e
     nil
   end
+
+  # Records the files a compile of the entry point reached. A compile that
+  # failed stopped at the error and saw only some of them: those are added to
+  # the dependencies already known rather than replacing them, so that no
+  # file drops out of the project over an error elsewhere.
+  def record_requires(requires : Enumerable(String), *, complete : Bool) : Nil
+    @dependencies = complete ? requires.to_set : @dependencies.concat(requires)
+    @outsiders.subtract(requires)
+  end
+
   # Flags to pass to the underlying compiler (e.g. -Dexecution_context).
   getter flags : Array(String) do
     (shard_yaml.dig?("crystalline", "flags").try(&.as_a.map(&.as_s)) || [] of String).tap do |flags|

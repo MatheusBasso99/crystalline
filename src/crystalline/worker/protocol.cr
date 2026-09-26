@@ -52,7 +52,9 @@ module Crystalline::Worker
     end
   end
 
-  # The compile is over and, on success, the snapshot is on disk.
+  # The compile is over and, on success, the snapshot is on disk. *requires*
+  # lists the files the compiler reached: all of them on success, those
+  # expanded before the error otherwise.
   struct Compiled < Message
     getter type = "compiled"
     getter? success : Bool

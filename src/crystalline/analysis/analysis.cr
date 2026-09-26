@@ -56,7 +56,7 @@ module Crystalline::Analysis
 
   # Compile an array of *sources* and publish the diagnostics to the client.
   def self.compile(server : LSP::Server, sources : Array(Crystal::Compiler::Source), *, lib_path : String? = nil, file_overrides : Hash(String, String)? = nil, ignore_diagnostics = false, wants_doc = false, fail_fast = false, top_level = false, compiler_flags : Array(String) = [] of String)
-    result, diagnostics = compile_with_diagnostics(sources, lib_path: lib_path, file_overrides: file_overrides, wants_doc: wants_doc, fail_fast: fail_fast, top_level: top_level, compiler_flags: compiler_flags)
+    result, diagnostics, _ = compile_with_diagnostics(sources, lib_path: lib_path, file_overrides: file_overrides, wants_doc: wants_doc, fail_fast: fail_fast, top_level: top_level, compiler_flags: compiler_flags)
     diagnostics.publish(server) unless ignore_diagnostics
     result
   end
@@ -68,8 +68,13 @@ module Crystalline::Analysis
 
   # Compile an array of *sources*. The diagnostics are returned instead of
   # being published: the worker process has no client to publish them to.
-  def self.compile_with_diagnostics(sources : Array(Crystal::Compiler::Source), *, lib_path : String? = nil, file_overrides : Hash(String, String)? = nil, wants_doc = false, fail_fast = false, top_level = false, compiler_flags : Array(String) = [] of String) : {Crystal::Compiler::Result?, Diagnostics}
+  # The files the compiler reached come last: every require of *sources* on
+  # success, those expanded before the error when the compile raised.
+  def self.compile_with_diagnostics(sources : Array(Crystal::Compiler::Source), *, lib_path : String? = nil, file_overrides : Hash(String, String)? = nil, wants_doc = false, fail_fast = false, top_level = false, compiler_flags : Array(String) = [] of String) : {Crystal::Compiler::Result?, Diagnostics, Array(String)}
     diagnostics = Diagnostics.new
+    # Created outside the compile fiber: the program of a compile that raised,
+    # and with it the requires it reached, is only reachable through it.
+    compiler = Crystal::Compiler.new
     reply_channel = Channel(Crystal::Compiler::Result | Exception).new
 
     # LSP::Log.info { "sources: #{sources.map(&.filename)}" }
@@ -79,7 +84,6 @@ module Crystalline::Analysis
     # Delegate heavy processing to a separate thread.
     spawn_dedicated do
       dev_null = File.open(File::NULL, "w")
-      compiler = Crystal::Compiler.new
       compiler.no_codegen = true
       compiler.color = false
       compiler.no_cleanup = true
@@ -131,7 +135,7 @@ module Crystalline::Analysis
       diagnostics.append_from_exception(e)
     end
 
-    {result, diagnostics}
+    {result, diagnostics, result.program.requires.to_a}
   rescue e : Exception
     if e.is_a?(Crystal::TypeException) || e.is_a?(Crystal::SyntaxException)
       LSP::Log.debug(exception: e) { "#{e}" }
@@ -139,7 +143,7 @@ module Crystalline::Analysis
     else
       LSP::Log.debug(exception: e) { "#{e.message}\n#{e.backtrace?}" }
     end
-    {nil, diagnostics || Diagnostics.new}
+    {nil, diagnostics || Diagnostics.new, compiler.try(&.program?).try(&.requires.to_a) || [] of String}
   end
 
   # True when the error is located inside the stdlib's llvm wrapper, where the
