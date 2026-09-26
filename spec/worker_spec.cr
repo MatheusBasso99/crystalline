@@ -86,6 +86,24 @@ describe Crystalline::Worker do
     end
   end
 
+  it "ships the files a compile that failed had reached" do
+    with_worker_project(%(require "./broken"\n)) do |root, path|
+      broken = File.join(root, "src", "broken.cr")
+      File.write(broken, "class Broken < Missing\nend\n")
+      job = job_for(path)
+      worker = Crystalline::Worker::Client.spawn
+      published = [] of Hash(String, Array(LSP::Diagnostic))
+
+      compiled = worker.compile(job) { |diagnostics| published << diagnostics }.should_not be_nil
+      compiled.success?.should be_false
+      compiled.requires.should contain(path)
+      compiled.requires.should contain(broken)
+      published.first["file://#{broken}"].map(&.message).join.should contain("undefined constant Missing")
+    ensure
+      worker.try(&.close)
+    end
+  end
+
   it "answers the semantic queries like the program it holds" do
     with_worker_project(SOURCE) do |_root, path|
       uri = URI.parse("file://#{path}")
@@ -224,6 +242,53 @@ describe Crystalline::Workspace do
       second.as(Crystalline::Worker::Client).closed?.should be_false
     ensure
       second.try(&.close)
+    end
+  end
+
+  it "compiles a file created after the dependency calculation through the entry point" do
+    source = <<-CRYSTAL
+      class Job
+        macro inherited
+          {% raise "jobs are final" %}
+        end
+      end
+
+      require "./jobs/*"
+      CRYSTAL
+
+    with_worker_project(source) do |root, path|
+      jobs = File.join(root, "src", "jobs")
+      Dir.mkdir_p(jobs)
+      File.write(File.join(jobs, "existing.cr"), "")
+      server = LSP::Server.new(IO::Memory.new, IO::Memory.new)
+      workspace = Crystalline::Workspace.new(server, "file://#{root}")
+      project = workspace.projects.first
+      workspace.recalculate_dependencies(server, project)
+      project.dependencies.should contain(path)
+
+      # Created after that calculation, and wrong in a way its own compile
+      # reports as `undefined constant Job`, which is not the error.
+      created = File.join(jobs, "created.cr")
+      File.write(created, "class Created < Job\nend\n")
+      created_uri = URI.parse("file://#{created}")
+      workspace.opened_documents[created_uri.to_s] = Crystalline::TextDocument.new(created_uri, nil, File.read(created))
+
+      accept_progress(server)
+      workspace.compile(server, created_uri, ignore_diagnostics: false, discard_nil_cached_result: true).should be_nil
+
+      project.dependencies.should contain(created)
+      project.outsiders.should be_empty
+      server.output.to_s.should contain("jobs are final")
+      server.output.to_s.should_not contain("undefined constant Job")
+
+      # A file the entry point does not require compiles on its own, and is
+      # not looked for again.
+      scratch = File.join(root, "scratch.cr")
+      File.write(scratch, "")
+      accept_progress(server)
+      workspace.compile(server, URI.parse("file://#{scratch}"), ignore_diagnostics: true)
+      project.outsiders.should eq(Set{scratch})
+      project.dependencies.should_not contain(scratch)
     end
   end
 end

@@ -26,7 +26,7 @@ module Crystalline::Worker
     return unless line = input.gets
 
     job = Job.from_json(line)
-    result, diagnostics = Analysis.compile_with_diagnostics(
+    result, diagnostics, requires = Analysis.compile_with_diagnostics(
       Analysis.sources_for(job.entry),
       lib_path: job.lib_path,
       wants_doc: job.wants_doc,
@@ -36,14 +36,15 @@ module Crystalline::Worker
     send(output, DiagnosticsMessage.new(diagnostics.to_h))
 
     unless result
-      send(output, Compiled.new(success: false))
+      # Up to the error, the compile still tells which files the entry point requires.
+      send(output, Compiled.new(success: false, requires: requires))
       return
     end
 
     File.open(job.snapshot_path, "w") do |file|
       GC.with_free_space_divisor(SNAPSHOT_GC_DIVISOR) { Lightweight::Snapshot.write(result, file) }
     end
-    send(output, Compiled.new(success: true, requires: result.program.requires.to_a))
+    send(output, Compiled.new(success: true, requires: requires))
     return if job.top_level
 
     # Nothing allocates while the worker waits for queries, so the collector

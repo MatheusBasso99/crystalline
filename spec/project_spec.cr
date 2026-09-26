@@ -26,4 +26,19 @@ describe Crystalline::Project do
       FileUtils.rm_rf(root)
     end
   end
+
+  it "adds the requires of a compile that failed to the known dependencies" do
+    project = Crystalline::Project.new(URI.parse("file:///project"))
+    project.record_requires(["/project/src/main.cr", "/project/src/a.cr"], complete: true)
+    project.outsiders << "/project/src/b.cr"
+
+    # The compile stopped at an error after b.cr: a.cr is not dropped for it.
+    project.record_requires(["/project/src/main.cr", "/project/src/b.cr"], complete: false)
+    project.dependencies.should eq(Set{"/project/src/main.cr", "/project/src/a.cr", "/project/src/b.cr"})
+    project.outsiders.should be_empty
+
+    # A compile that went through knows them all.
+    project.record_requires(["/project/src/main.cr"], complete: true)
+    project.dependencies.should eq(Set{"/project/src/main.cr"})
+  end
 end

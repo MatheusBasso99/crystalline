@@ -131,8 +131,7 @@ class Crystalline::Workspace
     LSP::Log.info { "[compile] dependency recalculation: #{target.decoded_path}" }
     # The top-level pass gives the compiler-derived method restrictions and
     # block contracts within seconds, before the full compile finishes.
-    compile_in_worker(server, target, project, wants_doc: true, top_level: true, ignore_diagnostics: true) do |_worker, compiled, snapshot|
-      project.dependencies = compiled.requires.to_set
+    compile_in_worker(server, target, project, wants_doc: true, top_level: true, ignore_diagnostics: true) do |_worker, _compiled, snapshot|
       publish_snapshot(project, snapshot)
       false
     end
@@ -161,7 +160,7 @@ class Crystalline::Workspace
       recalculate_dependencies(server, project) if project.dependencies.size < 2
     end
 
-    project = Project.best_fit_for_file(@projects, file_uri)
+    project = Project.best_fit_for_file(@projects, file_uri) || adopt(server, file_uri)
 
     # LSP::Log.info { "Compiling #{file_uri}, project: #{project.try(&.root_uri.decoded_path)}" }
 
@@ -230,8 +229,6 @@ class Crystalline::Workspace
         @semantic_cache.delete(target_string).try(&.close)
         compile_in_worker(server, target, project, wants_doc: wants_doc, top_level: top_level, ignore_diagnostics: ignore_diagnostics) do |worker, compiled, snapshot|
           message = "Completed successfully."
-          # Store the project dependencies.
-          project.try(&.dependencies = compiled.requires.to_set) if project.try(&.entry_point?)
 
           # A client event may have invalidated the compile while it was
           # running: the worker is only kept when still relevant.
@@ -264,6 +261,29 @@ class Crystalline::Workspace
     end
   end
 
+  # A file under a project's root that the last dependency calculation did
+  # not reach — one created since, typically — would compile as its own entry
+  # point, without anything the project requires, and report errors that are
+  # not there. Looks for it from the entry point once more before letting it
+  # compile on its own; a file still missing is left alone until a compile
+  # of the entry point reaches it.
+  private def adopt(server : LSP::Server, file_uri : URI) : Project?
+    path = file_uri.decoded_path
+    project = Project.best_fit_for_file(@projects, file_uri, require_dependency: false)
+    return unless project && (entry_point = project.entry_point?) && !project.outsiders.includes?(path)
+
+    LSP::Log.info { "[compile] not a known dependency of #{entry_point.decoded_path}: #{path}" }
+    recalculate_dependencies(server, project)
+    unless project.dependencies.includes?(path)
+      project.outsiders << path
+      return
+    end
+
+    # The last compile of the entry point did not cover this file.
+    @result_cache.invalidate(entry_point.to_s)
+    project
+  end
+
   # Compiles *target* in a worker process and, on success, yields the worker
   # along with what it reported and the lightweight snapshot it built. The
   # worker outlives the call only when the block returns true.
@@ -280,6 +300,11 @@ class Crystalline::Workspace
     @compiling[target.to_s] = worker unless top_level
     compiled = worker.compile(job) do |diagnostics|
       Diagnostics.new(diagnostics).publish(server) unless ignore_diagnostics
+    end
+    # The requires of the entry point say which files make up the project,
+    # and a compile that failed still reports the ones it reached.
+    if compiled && project && target == project.entry_point?
+      project.record_requires(compiled.requires, complete: compiled.success?)
     end
     # The snapshot is parsed off the event loop: it is large on a large project.
     if compiled && compiled.success? && (snapshot = Analysis.run_dedicated { Worker::Client.take_snapshot(job) })

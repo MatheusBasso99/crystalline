@@ -294,6 +294,11 @@ With the configuration above, every file required by `src/entry.cr` will use
 If this `shard.yml` entry is not present, or if the file is not part of the main
 dependency tree then `crystalline` will use the file itself as the entry point.
 
+The dependency tree is read from the requires of the entry point, and kept up
+to date by every compile of it, including one that fails part way. A file
+created since the last compile is looked for from the entry point again before
+it is compiled on its own (e.g. a new file under a `require "./jobs/**"`).
+
 **To override this behaviour**, you can add a configuration key in the
 `shard.yml` file.
 
