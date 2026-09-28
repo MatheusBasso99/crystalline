@@ -171,8 +171,21 @@ module Crystal
     getter filename
   end
 
+  class SemanticVisitor < Visitor
+    # The expression nesting `visit_any` and `end_visit_any` maintain. An
+    # error-tolerant compile restores it when a node raises between the two:
+    # see `ASTNode#accept` below.
+    property exp_nest : Int32
+  end
+
   class ASTNode
     def accept(visitor)
+      # `visit_any` increments the expression nesting of a semantic visitor
+      # and `end_visit_any` decrements it. A node that raises in between
+      # would leave the count off by one for the rest of the pass, and every
+      # def, class or module visited afterwards would be reported as
+      # declared "dynamically": the count is restored when the error is kept.
+      exp_nest = visitor.exp_nest if visitor.is_a?(Crystal::SemanticVisitor)
       if visitor.visit_any self
         if visitor.visit self
           accept_children visitor
@@ -182,6 +195,7 @@ module Crystal
       end
     rescue e : Crystal::CodeError
       if !visitor.is_a?(Crystal::TopLevelVisitor) && visitor.responds_to? :program && visitor.program.error_tolerant
+        visitor.exp_nest = exp_nest if visitor.is_a?(Crystal::SemanticVisitor) && exp_nest
         visitor.program.error_stack << e
       else
         ::raise e
