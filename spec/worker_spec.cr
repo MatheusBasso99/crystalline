@@ -104,6 +104,41 @@ describe Crystalline::Worker do
     end
   end
 
+  it "keeps reporting the real error alone when a node raises inside an expression" do
+    # `add` is undefined: the call raises after `visit_any` counted it as a
+    # nested expression. Without restoring the count, every def and class
+    # after it is reported as declared "dynamically".
+    source = <<-CRYSTAL
+      class Foo
+        add muted_at : Time?
+
+        def bar
+        end
+      end
+
+      class Qux
+        def quux
+        end
+      end
+
+      def top_level
+      end
+      CRYSTAL
+    with_worker_project(source) do |_root, path|
+      job = job_for(path)
+      worker = Crystalline::Worker::Client.spawn
+      published = [] of Hash(String, Array(LSP::Diagnostic))
+
+      worker.compile(job) { |diagnostics| published << diagnostics }.should_not be_nil
+      messages = published.first["file://#{path}"].map(&.message)
+      messages.size.should eq(1)
+      messages.first.should contain("undefined method 'add' for Foo.class")
+    ensure
+      worker.try(&.close)
+      job.try { |j| File.delete?(j.snapshot_path) }
+    end
+  end
+
   it "answers the semantic queries like the program it holds" do
     with_worker_project(SOURCE) do |_root, path|
       uri = URI.parse("file://#{path}")
