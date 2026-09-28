@@ -50,7 +50,8 @@ this fork
 |---|---|---|
 | New file in the project | false errors | compiled through the entry point |
 | Checkout under a path with spaces | build fails | builds |
-| Spec suite | — | 359 examples, 0 failures |
+| A real error in a file | buried under "can't declare def dynamically" in hundreds of files | reported alone |
+| Spec suite | — | 360 examples, 0 failures |
 
 <details><summary>How this was measured</summary>
 
@@ -134,6 +135,7 @@ What changed (allocation and string counts as measured in the commits):
 
 | Commit | Problem | Fix |
 |---|---|---|
+| `9ce902c` | One error kept by the error-tolerant compile left the expression nesting off by one: every def, class or module visited after it was reported as declared "dynamically" (one bad line in a Lucky model → 5 819 diagnostics in 917 files, the real error buried among them) | The nesting is captured before each visit and restored when the error is kept; only the real error is reported |
 | `bfcee94` | A new file (e.g. a Mosquito job) was compiled on its own, without the project's requires, and reported errors that are not there (`undefined constant Mosquito::QueuedJob`) | The file is looked for from the entry point first; the requires of a failed compile are kept as dependencies too |
 | `871f868` | Unquoted `shards version` broke the build under a path with spaces (`/Volumes/SSD 111GB/...` → "Missing SSD") | `__DIR__` is quoted |
 | `a570687` | `resolver.cr` not `crystal tool format`-clean | formatted |
@@ -168,12 +170,16 @@ gitGraph
     commit id: "bfcee94"
     checkout main
     merge fix/adopt-new-files
+    branch fix/error-tolerant-exp-nest
+    commit id: "9ce902c"
+    checkout main
+    merge fix/error-tolerant-exp-nest
 ```
 
 ## Tests
 
-`spec/worker_spec.cr` (new: worker protocol, snapshot, memory pressure, new files),
-`spec/project_spec.cr`, `spec/workspace_interactive_spec.cr` — **+387 lines** of specs.
+`spec/worker_spec.cr` (new: worker protocol, snapshot, memory pressure, new files, error
+cascade), `spec/project_spec.cr`, `spec/workspace_interactive_spec.cr` — **+422 lines** of specs.
 
 ## Feature parity with 0.20.0
 
