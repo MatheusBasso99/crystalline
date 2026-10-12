@@ -128,79 +128,59 @@ describe Crystalline::TextDocument do
     document.version.should eq(7)
   end
 
-  it "applies queued changes in order once the missing version arrives" do
-    document = doc("one\ntwo\nthree\n")
+  it "applies a change whose version skips numbers" do
+    document = doc("one\ntwo\n")
 
     document.update_contents([{"ONE", LSP::Range.new(
       start: LSP::Position.new(line: 0, character: 0),
       end: LSP::Position.new(line: 0, character: 3),
     )}], version: 1)
-
-    # Version 2 is missing: both version 3 changes are queued.
+    # Neovim sends its changedtick and coalesces a typing burst into one
+    # notification, so versions skip numbers: the change still applies.
     document.update_contents([{"TWO", LSP::Range.new(
       start: LSP::Position.new(line: 1, character: 0),
       end: LSP::Position.new(line: 1, character: 3),
-    )}], version: 3)
-    document.update_contents([{"THREE", LSP::Range.new(
-      start: LSP::Position.new(line: 2, character: 0),
-      end: LSP::Position.new(line: 2, character: 5),
-    )}], version: 3)
-
-    document.update_contents([{"two", LSP::Range.new(
-      start: LSP::Position.new(line: 1, character: 0),
-      end: LSP::Position.new(line: 1, character: 3),
-    )}], version: 2)
-
-    document.contents.should eq("ONE\nTWO\nTHREE\n")
-  end
-
-  it "keeps changes queued while a version is still missing" do
-    document = doc("first\n")
-
-    document.update_contents([{"SECND", LSP::Range.new(
-      start: LSP::Position.new(line: 0, character: 0),
-      end: LSP::Position.new(line: 0, character: 5),
-    )}], version: 1)
-    document.update_contents([{"FORTH", LSP::Range.new(
-      start: LSP::Position.new(line: 0, character: 0),
-      end: LSP::Position.new(line: 0, character: 5),
     )}], version: 4)
 
-    document.update_contents([{"THIRD", LSP::Range.new(
-      start: LSP::Position.new(line: 0, character: 0),
-      end: LSP::Position.new(line: 0, character: 5),
-    )}], version: 2)
-
-    # Version 3 is still missing: the version 4 change must stay queued.
-    document.contents.should eq("THIRD\n")
-
-    document.update_contents([{"FOURT", LSP::Range.new(
-      start: LSP::Position.new(line: 0, character: 0),
-      end: LSP::Position.new(line: 0, character: 5),
-    )}], version: 3)
-
-    # The gap is filled: the queued version 4 change now applies.
-    document.contents.should eq("FORTH\n")
+    document.contents.should eq("ONE\nTWO\n")
+    document.version.should eq(4)
   end
 
-  it "clears stale pending changes when a full update arrives" do
+  it "applies the changes of one notification in order" do
+    document = doc("abc\n")
+
+    # Two changes in one didChange: the second range is relative to the
+    # document after the first one (LSP 3.17, TextDocumentContentChangeEvent).
+    document.update_contents([
+      {"X", LSP::Range.new(
+        start: LSP::Position.new(line: 0, character: 0),
+        end: LSP::Position.new(line: 0, character: 1),
+      )},
+      {"Y", LSP::Range.new(
+        start: LSP::Position.new(line: 0, character: 1),
+        end: LSP::Position.new(line: 0, character: 1),
+      )},
+    ], version: 3)
+
+    document.contents.should eq("XYbc\n")
+    document.version.should eq(3)
+  end
+
+  it "interleaves full and incremental updates in order" do
     document = doc("foo\n")
 
     document.update_contents([
       {"bar\n", nil},
     ], version: 1)
-
     document.update_contents([
       {"baz", LSP::Range.new(
         start: LSP::Position.new(line: 0, character: 0),
         end: LSP::Position.new(line: 0, character: 3),
       )},
     ], version: 3)
-
     document.update_contents([
       {"qux\n", nil},
     ], version: 4)
-
     document.update_contents([
       {"zap", LSP::Range.new(
         start: LSP::Position.new(line: 0, character: 0),
