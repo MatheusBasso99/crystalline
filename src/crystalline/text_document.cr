@@ -12,9 +12,6 @@ class Crystalline::TextDocument
     @version || 0
   end
 
-  # Changes received before their version, ordered by version and, within a
-  # version, in arrival order.
-  @pending_changes = [] of {Int32, String, LSP::Range}
   getter? project : Project?
   getter? dirty = false
 
@@ -47,21 +44,30 @@ class Crystalline::TextDocument
     end
   end
 
+  # Applies the changes of one `didChange` notification in the order the
+  # client sent them, then adopts the notification's version.
+  #
+  # The version is a label, not a sequence: the protocol only promises that
+  # it increases after each change, not that it is consecutive. Neovim sends
+  # its `changedtick` and coalesces every edit made within its debounce
+  # window into a single notification, so a burst of keystrokes skips
+  # numbers. Gating on consecutive versions (as 0.20.0 did) queued such a
+  # change "until the missing version arrived", which never happened: the
+  # server's copy of the buffer stayed frozen until the file was reopened,
+  # completion replaced ranges computed on stale text, semantic tokens
+  # landed on old positions and a format request would have reverted the
+  # edits. Notifications arrive in order, so applying them in order is all
+  # the synchronisation the protocol asks for.
   def update_contents(content_changes : Array({String, LSP::Range?}), version : Int32? = nil)
-    content_changes.each { |change|
-      update_contents(*change, version: version)
-    }
-
-    # Apply the pending changes that can now follow the document version, in order.
-    #
-    # A queued version holds one entry per change of the notification that carried
-    # it: the first is drained once the document reaches the previous version, the
-    # following ones right after, as the current version.
-    while (pending = @pending_changes.first?) && (pending[0] == version_number || pending[0] == version_number + 1)
-      @pending_changes.shift
-      partial_update(pending[1], pending[2], version: pending[0])
+    content_changes.each do |(contents, range)|
+      if range
+        partial_update(contents, range)
+      else
+        full_update(contents)
+      end
     end
 
+    @version = version if version
     @dirty = true
   end
 
@@ -69,38 +75,7 @@ class Crystalline::TextDocument
     @dirty = false
   end
 
-  private def update_contents(contents : String, range : LSP::Range? = nil, version : Int32? = nil)
-    if range
-      # Incremental update
-      if version && check_version(version)
-        # Version is up-to-date
-        partial_update(contents, range, version)
-      elsif version
-        # Some updates are missing
-        queue_change(version, contents, range)
-      else
-        # No version field.
-        partial_update(contents, range, version)
-      end
-    else
-      # Full update
-      full_update(contents, version)
-    end
-  end
-
-  private def check_version(version : Int32)
-    @version ||= version
-    @version == version - 1 || @version == version
-  end
-
-  # Queue a change that arrived before its version, keeping the queue ordered by
-  # version and stable within a version.
-  private def queue_change(version : Int32, contents : String, range : LSP::Range)
-    index = @pending_changes.bsearch_index { |(queued_version, _, _)| queued_version > version } || @pending_changes.size
-    @pending_changes.insert(index, {version, contents, range})
-  end
-
-  private def partial_update(contents : String, range : LSP::Range, version : Int32? = nil)
+  private def partial_update(contents : String, range : LSP::Range)
     start_line = @inner_contents[range.start.line]? || ""
     end_line = @inner_contents[range.end.line]? || ""
     # LSP columns are UTF-16 code units, unlike Crystal string indices.
@@ -116,12 +91,9 @@ class Crystalline::TextDocument
       str << prefix << contents << suffix
     }.lines(chomp: false)
     @inner_contents = (@inner_contents[...range.start.line]? || [] of String) + replacement_lines + (@inner_contents[range.end.line + 1...]? || [] of String)
-    @version = version if version
   end
 
-  private def full_update(contents : String, version : Int32? = nil)
-    @pending_changes.clear
+  private def full_update(contents : String)
     self.contents = contents
-    @version = version if version
   end
 end
