@@ -5,7 +5,7 @@ whether they are worth adopting upstream. Each change is a separate, themed comm
 
 | | |
 |---|---|
-| Commits | **11** (+ 4 merges) |
+| Commits | **16** (+ 6 merges) |
 | Diff | 24 files, **+1467 / −398** lines (source: +1058 / −392, specs: +387) |
 | Reference project | Lucky 1.5 + Avram app — 678 files in `src`, 2069 in `lib` (macOS, Apple Silicon, 16 GB) |
 
@@ -51,6 +51,7 @@ this fork
 | New file in the project | false errors | compiled through the entry point |
 | Checkout under a path with spaces | build fails | builds |
 | A real error in a file | buried under "can't declare def dynamically" in hundreds of files | reported alone |
+| Typing burst in Neovim (`didChange` version skips a number) | server copy of the buffer frozen until the file is reopened: completion inserts mid-word, semantic tokens on old positions | kept in sync |
 | Spec suite | — | 360 examples, 0 failures |
 
 <details><summary>How this was measured</summary>
@@ -135,6 +136,7 @@ What changed (allocation and string counts as measured in the commits):
 
 | Commit | Problem | Fix |
 |---|---|---|
+| `07f13ab` | A `didChange` whose version skipped a number was queued "until the missing version arrived", which never happened. Neovim sends its `changedtick` and coalesces a typing burst into one notification, so from the first burst on the server's copy of the buffer froze until the file was reopened (`didSave` carries no text): completion replaced a range computed on stale text (`FinFinder::Xder::`), semantic tokens landed on old positions, a format request would have reverted the edits | Changes are applied in arrival order and the version is just recorded; the protocol only promises increasing versions, not consecutive ones |
 | `9ce902c` | One error kept by the error-tolerant compile left the expression nesting off by one: every def, class or module visited after it was reported as declared "dynamically" (one bad line in a Lucky model → 5 819 diagnostics in 917 files, the real error buried among them) | The nesting is captured before each visit and restored when the error is kept; only the real error is reported |
 | `bfcee94` | A new file (e.g. a Mosquito job) was compiled on its own, without the project's requires, and reported errors that are not there (`undefined constant Mosquito::QueuedJob`) | The file is looked for from the entry point first; the requires of a failed compile are kept as dependencies too |
 | `871f868` | Unquoted `shards version` broke the build under a path with spaces (`/Volumes/SSD 111GB/...` → "Missing SSD") | `__DIR__` is quoted |
@@ -174,12 +176,17 @@ gitGraph
     commit id: "9ce902c"
     checkout main
     merge fix/error-tolerant-exp-nest
+    branch fix/didchange-version-gap
+    commit id: "07f13ab"
+    checkout main
+    merge fix/didchange-version-gap
 ```
 
 ## Tests
 
 `spec/worker_spec.cr` (new: worker protocol, snapshot, memory pressure, new files, error
-cascade), `spec/project_spec.cr`, `spec/workspace_interactive_spec.cr` — **+422 lines** of specs.
+cascade), `spec/project_spec.cr`, `spec/workspace_interactive_spec.cr`, `spec/text_document_spec.cr`
+(document sync: skipped versions, several changes per notification) — **+422 lines** of specs.
 
 ## Feature parity with 0.20.0
 
