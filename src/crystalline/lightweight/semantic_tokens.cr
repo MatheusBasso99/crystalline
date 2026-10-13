@@ -11,8 +11,8 @@ module Crystalline::Lightweight
   # Tokens come from the syntax tree, with the source text checked before a
   # token is emitted: macro generated nodes carry locations of the macro call
   # site (or none), and a wrong token is worse than a missing one. Literals
-  # spanning several lines (heredocs) only color their first line, the
-  # remaining lines are left to the client's own grammar.
+  # spanning several lines are colored line by line; a heredoc colors its
+  # opener (`<<-TEXT`) and its body, not the code between them.
   #
   # Clients keep their grammar based highlighting for everything that is not
   # tokenized here (keywords inside expressions, operators, the `#{` and `}`
@@ -73,14 +73,16 @@ module Crystalline::Lightweight
       @lines = source.lines(chomp: false)
       @tokens = [] of Token
       @interpolations = [] of {Crystal::Location, Crystal::Location}
+      @heredocs = {} of {Int32, Int32} => {Int32, Int32}
       @literals = [] of { {Int32, Int32}, {Int32, Int32} }
     end
 
     def tokens : LSP::SemanticTokens?
       begin
-        parser = InterpolationParser.new(@source)
+        parser = LiteralParser.new(@source)
         node = parser.parse
         @interpolations = parser.interpolations.sort_by { |(start, _)| {start.line_number, start.column_number} }
+        @heredocs = parser.heredoc_bodies
         node.accept(Visitor.new(self))
       rescue Crystal::SyntaxException
         # Mid-edit buffers often do not parse: the comments are still known
@@ -211,6 +213,19 @@ module Crystalline::Lightweight
         finish = line_index == end_line ? end_location.column_number : line.size
         add_segment(line_index, 0, finish, type, holes)
       end
+    end
+
+    # Internal: a heredoc's tokens, its opener and its body: the code after
+    # the opener (`foo(<<-TEXT, bar)`) is not part of the literal. Returns
+    # false for any other literal.
+    def add_heredoc(node : Crystal::StringInterpolation) : Bool
+      return false unless (location = node.location) && (end_location = node.end_location)
+      return false unless heredoc = @heredocs[{location.line_number, location.column_number}]?
+
+      opener_size, body_line = heredoc
+      add_token(location.line_number - 1, location.column_number - 1, opener_size, STRING, expected: "<<-")
+      add_span(Crystal::Location.new(location.filename, body_line, 1), end_location, STRING)
+      true
     end
 
     # The interpolations (`#{` to `}`, both included) inside a span, in
@@ -388,6 +403,17 @@ module Crystalline::Lightweight
       end
 
       def visit(node : Crystal::StringInterpolation)
+        if @tokens.add_heredoc(node)
+          # A heredoc without interpolation holds a string literal spanning
+          # the whole heredoc again, opener included.
+          node.expressions.each do |expression|
+            next if expression.is_a?(Crystal::StringLiteral) && same_start?(expression, node)
+
+            expression.accept(self)
+          end
+          return false
+        end
+
         @tokens.add_span(node.location, node.end_location, STRING)
         true
       end
@@ -433,6 +459,12 @@ module Crystalline::Lightweight
         end
       end
 
+      private def same_start?(node : Crystal::ASTNode, other : Crystal::ASTNode) : Bool
+        return false unless (location = node.location) && (other_location = other.location)
+
+        location.line_number == other_location.line_number && location.column_number == other_location.column_number
+      end
+
       private def add_end_keyword(node : Crystal::ASTNode) : Nil
         return unless location = node.end_location
 
@@ -441,10 +473,13 @@ module Crystalline::Lightweight
       end
     end
 
-    # Records where every interpolation sits (`#{` to `}`), which the syntax
-    # tree does not keep: the literal pieces around them have no location.
-    private class InterpolationParser < Crystal::Parser
+    # Records what the syntax tree does not keep about literals: where every
+    # interpolation sits (`#{` to `}`), as the literal pieces around them have
+    # no location, and where each heredoc's body starts.
+    private class LiteralParser < Crystal::Parser
       getter interpolations = [] of {Crystal::Location, Crystal::Location}
+      # The opener's location => its size and the body's first line.
+      getter heredoc_bodies = {} of {Int32, Int32} => {Int32, Int32}
       @interpolation_starts = [] of Crystal::Location
 
       # The parser skips the `#{` token with this call right before parsing
@@ -461,6 +496,18 @@ module Crystalline::Lightweight
           @interpolations << {start, @token.location}
         end
         expression
+      end
+
+      # Called once the line holding the opener is parsed, with the lexer at
+      # the start of the body: after the opener's line, or after the previous
+      # body when several heredocs open on one line.
+      def consume_heredoc(delimiter_state, node)
+        if location = node.location
+          # `<<-TEXT`, or `<<-'TEXT'` for a heredoc without escapes.
+          opener_size = 3 + delimiter_state.end.to_s.size + (delimiter_state.allow_escapes ? 0 : 2)
+          @heredoc_bodies[{location.line_number, location.column_number}] = {opener_size, @line_number}
+        end
+        super
       end
     end
   end
