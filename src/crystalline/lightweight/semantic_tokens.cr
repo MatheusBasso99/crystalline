@@ -15,7 +15,9 @@ module Crystalline::Lightweight
   # remaining lines are left to the client's own grammar.
   #
   # Clients keep their grammar based highlighting for everything that is not
-  # tokenized here (keywords inside expressions, operators, interpolations).
+  # tokenized here (keywords inside expressions, operators, the `#{` and `}`
+  # of interpolations). A literal's token leaves its interpolations out, so
+  # the code inside them is tokenized like any other expression.
   class SemanticTokens
     TOKEN_TYPES = [
       "namespace",
@@ -70,11 +72,16 @@ module Crystalline::Lightweight
     def initialize(@source : String)
       @lines = source.lines(chomp: false)
       @tokens = [] of Token
+      @interpolations = [] of {Crystal::Location, Crystal::Location}
+      @literals = [] of { {Int32, Int32}, {Int32, Int32} }
     end
 
     def tokens : LSP::SemanticTokens?
       begin
-        Crystal::Parser.new(@source).parse.accept(Visitor.new(self))
+        parser = InterpolationParser.new(@source)
+        node = parser.parse
+        @interpolations = parser.interpolations.sort_by { |(start, _)| {start.line_number, start.column_number} }
+        node.accept(Visitor.new(self))
       rescue Crystal::SyntaxException
         # Mid-edit buffers often do not parse: the comments are still known
         # exactly (the mask is line based), the rest is left to the client.
@@ -115,10 +122,16 @@ module Crystalline::Lightweight
       unique
     end
 
+    # The mask only knows double-quoted strings and chars: a `#` it takes for
+    # a comment start inside another literal (the `#{` of a regexp, of a
+    # `%(...)` string) is ruled out by the literals of the syntax tree.
     private def collect_comments : Nil
       mask = SourceMask.new(@source)
       @lines.each_with_index do |line, line_index|
         next unless index = mask.comment_start(line_index)
+
+        position = {line_index, index}
+        next if @literals.any? { |(start, finish)| start <= position && position <= finish }
 
         add_token(line_index, index, line.rstrip.size - index, COMMENT)
       end
@@ -168,16 +181,19 @@ module Crystalline::Lightweight
       end
     end
 
-    # Internal: adds a token covering a node span (literals).
+    # Internal: adds a token covering a node span (literals), minus the
+    # interpolations inside it.
     def add_span(location : Crystal::Location?, end_location : Crystal::Location?, type : Int32) : Nil
       return unless location && end_location
 
       start_line = location.line_number - 1
       end_line = end_location.line_number - 1
       start_column = location.column_number - 1
+      @literals << { {start_line, start_column}, {end_line, end_location.column_number - 1} }
+      holes = interpolations_within(location, end_location)
 
       if start_line == end_line
-        add_token(start_line, start_column, end_location.column_number - location.column_number + 1, type)
+        add_segment(start_line, start_column, end_location.column_number, type, holes)
         return
       end
 
@@ -187,14 +203,43 @@ module Crystalline::Lightweight
       line = @lines[start_line]?
       return unless line
 
-      add_token(start_line, start_column, line.size - start_column, type)
+      add_segment(start_line, start_column, line.size, type, holes)
       ((start_line + 1)..end_line).each do |line_index|
         line = @lines[line_index]?
         next unless line
 
-        length = line_index == end_line ? end_location.column_number : line.size
-        add_token(line_index, 0, length, type)
+        finish = line_index == end_line ? end_location.column_number : line.size
+        add_segment(line_index, 0, finish, type, holes)
       end
+    end
+
+    # The interpolations (`#{` to `}`, both included) inside a span, in
+    # source order. One nested in another one is listed too and skipped by
+    # `add_segment`, as it ends before the enclosing one does.
+    private def interpolations_within(location : Crystal::Location, end_location : Crystal::Location) : Array({Crystal::Location, Crystal::Location})
+      return @interpolations if @interpolations.empty?
+
+      span_start = {location.line_number, location.column_number}
+      span_end = {end_location.line_number, end_location.column_number}
+      @interpolations.select do |(start, finish)|
+        {start.line_number, start.column_number} >= span_start && {finish.line_number, finish.column_number} <= span_end
+      end
+    end
+
+    # Adds the characters from *start* to *finish* (excluded) of a line, minus
+    # the parts the *holes* cover on that line.
+    private def add_segment(line_index : Int32, start : Int32, finish : Int32, type : Int32, holes : Array({Crystal::Location, Crystal::Location})) : Nil
+      holes.each do |(hole_start, hole_end)|
+        next unless (hole_start.line_number - 1..hole_end.line_number - 1).includes?(line_index)
+
+        cut_start = line_index == hole_start.line_number - 1 ? hole_start.column_number - 1 : 0
+        cut_end = line_index == hole_end.line_number - 1 ? hole_end.column_number : Int32::MAX
+        next if cut_end <= start || cut_start >= finish
+
+        add_token(line_index, start, cut_start - start, type)
+        start = cut_end
+      end
+      add_token(line_index, start, finish - start, type)
     end
 
     # Internal: adds a token covering *length* characters from *start* (both
@@ -393,6 +438,29 @@ module Crystalline::Lightweight
 
         start = Crystal::Location.new(location.filename, location.line_number, location.column_number - 2)
         @tokens.add_text(start, "end", KEYWORD)
+      end
+    end
+
+    # Records where every interpolation sits (`#{` to `}`), which the syntax
+    # tree does not keep: the literal pieces around them have no location.
+    private class InterpolationParser < Crystal::Parser
+      getter interpolations = [] of {Crystal::Location, Crystal::Location}
+      @interpolation_starts = [] of Crystal::Location
+
+      # The parser skips the `#{` token with this call right before parsing
+      # the interpolated expression.
+      def next_token_skip_space_or_newline
+        @interpolation_starts << @token.location if @token.type.interpolation_start?
+        super
+      end
+
+      # Returns on the closing `}`.
+      def consume_interpolation(delimiter_state)
+        expression = super
+        if start = @interpolation_starts.pop?
+          @interpolations << {start, @token.location}
+        end
+        expression
       end
     end
   end
