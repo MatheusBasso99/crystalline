@@ -5,8 +5,8 @@ whether they are worth adopting upstream. Each change is a separate, themed comm
 
 | | |
 |---|---|
-| Commits | **16** (+ 6 merges) |
-| Diff | 24 files, **+1467 / −398** lines (source: +1058 / −392, specs: +387) |
+| Commits | **19** (+ 8 merges) |
+| Diff | 29 files, **+1780 / −502** lines (source: +1219 / −452, specs: +539) |
 | Reference project | Lucky 1.5 + Avram app — 678 files in `src`, 2069 in `lib` (macOS, Apple Silicon, 16 GB) |
 
 ---
@@ -52,7 +52,9 @@ this fork
 | Checkout under a path with spaces | build fails | builds |
 | A real error in a file | buried under "can't declare def dynamically" in hundreds of files | reported alone |
 | Typing burst in Neovim (`didChange` version skips a number) | server copy of the buffer frozen until the file is reopened: completion inserts mid-word, semantic tokens on old positions | kept in sync |
-| Spec suite | — | 360 examples, 0 failures |
+| String with interpolations (`"#{channel.id}:#{channel.fee}"`) | one `string` semantic token over the whole literal: the interpolated code is painted as string, over the editor's own grammar | literal parts as `string`, the code inside tokenized as code |
+| Heredoc passed as an argument (`db.exec(<<-SQL, id)`) | the rest of the opener's line (`, id)`) colored as string | colored as code |
+| Spec suite | — | 367 examples, 0 failures |
 
 <details><summary>How this was measured</summary>
 
@@ -136,6 +138,8 @@ What changed (allocation and string counts as measured in the commits):
 
 | Commit | Problem | Fix |
 |---|---|---|
+| `343487a` | A heredoc's semantic token ran from its opener to the end of that line, so the code after the opener was colored as string (`AppDatabase.scalar(<<-SQL).as(Int64)`, `db.exec(<<-SQL, id)`); a heredoc without interpolation was tokenized twice | The tokenizing parser records where each body starts (after the opener's line, or after the previous body when several heredocs open on one line); a heredoc gets one token for its opener and one per body line |
+| `11ac5fc` | A string with interpolations got one `string` token from delimiter to delimiter. The tokens of the interpolated code overlapped it and were dropped, and since semantic tokens take precedence over the client's grammar, `"#{channel.id}:#{channel.fee}"` was painted in one color | The tokenizing parser records each `#{`…`}` region (the syntax tree keeps no location for the literal pieces) and a literal's token is emitted around them; a `#` the line-based comment mask took for a comment start inside a regexp or `%(...)` literal is no longer reported. No measurable cost: median 5.6 → 5.7 ms for the 6 598 lines of the compiler's `parser.cr` (30 runs, release builds of `283079e` and `c50d7dc`) |
 | `07f13ab` | A `didChange` whose version skipped a number was queued "until the missing version arrived", which never happened. Neovim sends its `changedtick` and coalesces a typing burst into one notification, so from the first burst on the server's copy of the buffer froze until the file was reopened (`didSave` carries no text): completion replaced a range computed on stale text (`FinFinder::Xder::`), semantic tokens landed on old positions, a format request would have reverted the edits | Changes are applied in arrival order and the version is just recorded; the protocol only promises increasing versions, not consecutive ones |
 | `9ce902c` | One error kept by the error-tolerant compile left the expression nesting off by one: every def, class or module visited after it was reported as declared "dynamically" (one bad line in a Lucky model → 5 819 diagnostics in 917 files, the real error buried among them) | The nesting is captured before each visit and restored when the error is kept; only the real error is reported |
 | `bfcee94` | A new file (e.g. a Mosquito job) was compiled on its own, without the project's requires, and reported errors that are not there (`undefined constant Mosquito::QueuedJob`) | The file is looked for from the entry point first; the requires of a failed compile are kept as dependencies too |
@@ -180,13 +184,23 @@ gitGraph
     commit id: "07f13ab"
     checkout main
     merge fix/didchange-version-gap
+    branch fix/semantic-tokens-interpolation
+    commit id: "11ac5fc"
+    checkout main
+    merge fix/semantic-tokens-interpolation
+    branch fix/semantic-tokens-heredoc
+    commit id: "343487a"
+    checkout main
+    merge fix/semantic-tokens-heredoc
 ```
 
 ## Tests
 
 `spec/worker_spec.cr` (new: worker protocol, snapshot, memory pressure, new files, error
 cascade), `spec/project_spec.cr`, `spec/workspace_interactive_spec.cr`, `spec/text_document_spec.cr`
-(document sync: skipped versions, several changes per notification) — **+422 lines** of specs.
+(document sync: skipped versions, several changes per notification),
+`spec/lightweight/semantic_tokens_spec.cr` (interpolations, nested strings, regexp and percent
+literals, heredocs) — **+539 lines** of specs.
 
 ## Feature parity with 0.20.0
 
@@ -228,3 +242,9 @@ Operational differences:
 - Trade-off of the worker: while a compile runs, or after a failed one, the compiler-backed
   fallback (hover / definition / completion misses of the lightweight engine) is unavailable;
   it comes back with the next successful compile.
+- `fix/semantic-tokens-interpolation` then `fix/semantic-tokens-heredoc` only touch
+  `semantic_tokens.cr` and its spec, unchanged since 0.20.0, so they apply to it as is. They
+  override three parser methods (`next_token_skip_space_or_newline`, `consume_interpolation`,
+  `consume_heredoc`) to record what the syntax tree drops. If a compiler upgrade renames them,
+  the overrides are no longer called (Crystal does not type-check an uncalled method) and the
+  tokens fall back to the 0.20.0 behaviour; the semantic tokens specs fail in that case.
