@@ -184,6 +184,35 @@ describe Crystalline::Lightweight::SemanticTokens do
     decoded.select { |token| token[0] == 5 && token[3] == 14 }.should be_empty
   end
 
+  it "tokenizes the code after a heredoc opener as code" do
+    source = "x = foo(<<-SQL, 1)\n  SELECT \#{id}\n  SQL\n"
+
+    decode_tokens(source).should eq([
+      {0, 0, 1, 7},   # x (variable)
+      {0, 4, 3, 10},  # foo (method)
+      {0, 8, 6, 14},  # <<-SQL
+      {0, 16, 1, 15}, # 1
+      {1, 0, 9, 14},  # "  SELECT "
+      {1, 11, 2, 10}, # id (method)
+      {2, 0, 5, 14},  # "  SQL"
+    ])
+  end
+
+  it "tokenizes the bodies of heredocs opened on one line" do
+    source = "foo(<<-A, <<-'B') # done\n  a\n  A\n  b \#{x}\n  B\n"
+
+    decode_tokens(source).should eq([
+      {0, 0, 3, 10},  # foo (method)
+      {0, 4, 4, 14},  # <<-A
+      {0, 10, 6, 14}, # <<-'B'
+      {0, 18, 6, 13}, # # done
+      {1, 0, 3, 14},
+      {2, 0, 3, 14},
+      {3, 0, 8, 14}, # no interpolation in a quoted heredoc
+      {4, 0, 3, 14},
+    ])
+  end
+
   it "keeps the regexp type around the interpolations of a regexp" do
     source = "r = /a\#{b}c/\n"
 
