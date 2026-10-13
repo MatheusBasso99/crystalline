@@ -142,6 +142,70 @@ describe Crystalline::Lightweight::SemanticTokens do
     decoded.select { |token| token[3] == 14 }.map { |token| token[0] }.should eq([0, 1, 2, 3])
   end
 
+  it "leaves the interpolations out of a string and tokenizes their code" do
+    source = "channel = 1\nkey = \"\#{channel.id}:\#{ channel.fee }\"\n"
+
+    decode_tokens(source).should eq([
+      {0, 0, 7, 7},   # channel (variable)
+      {0, 10, 1, 15}, # 1
+      {1, 0, 3, 7},   # key (variable)
+      {1, 6, 1, 14},  # "
+      {1, 9, 7, 7},   # channel (variable)
+      {1, 17, 2, 10}, # id (method)
+      {1, 20, 1, 14}, # :
+      {1, 24, 7, 7},  # channel (variable)
+      {1, 32, 3, 10}, # fee (method)
+      {1, 37, 1, 14}, # "
+    ])
+  end
+
+  it "tokenizes a string nested in an interpolation" do
+    source = "x = \"a\#{\"b\#{y}c\"}d\"\n"
+
+    decode_tokens(source).select { |token| token[3] == 14 }.should eq([
+      {0, 4, 2, 14},  # "a
+      {0, 8, 2, 14},  # "b
+      {0, 14, 2, 14}, # c"
+      {0, 17, 2, 14}, # d"
+    ])
+  end
+
+  it "leaves the interpolations out of multi-line literals" do
+    source = "sql = <<-SQL\n  SELECT \#{column}\n  FROM t\n  SQL\nx = \"a\#{\n  1\n}b\"\n"
+
+    decoded = decode_tokens(source)
+
+    decoded.should contain({1, 0, 9, 14})  # "  SELECT "
+    decoded.should contain({1, 11, 6, 10}) # column (method)
+    decoded.should contain({2, 0, 8, 14})  # "  FROM t"
+    decoded.should contain({4, 4, 2, 14})  # "a
+    decoded.should contain({5, 2, 1, 15})  # 1
+    decoded.should contain({6, 1, 2, 14})  # b"
+    decoded.select { |token| token[0] == 5 && token[3] == 14 }.should be_empty
+  end
+
+  it "keeps the regexp type around the interpolations of a regexp" do
+    source = "r = /a\#{b}c/\n"
+
+    decode_tokens(source).should eq([
+      {0, 0, 1, 7},   # r (variable)
+      {0, 4, 2, 16},  # /a
+      {0, 8, 1, 10},  # b (method)
+      {0, 10, 2, 16}, # c/
+    ])
+  end
+
+  it "does not take the interpolation of a percent literal for a comment" do
+    source = "s = %(a\#{b})\n"
+
+    decode_tokens(source).should eq([
+      {0, 0, 1, 7},   # s (variable)
+      {0, 4, 3, 14},  # %(a
+      {0, 9, 1, 10},  # b (method)
+      {0, 11, 1, 14}, # )
+    ])
+  end
+
   it "keeps the comments of a buffer that does not parse" do
     source = "def broken( # unterminated\n"
 
